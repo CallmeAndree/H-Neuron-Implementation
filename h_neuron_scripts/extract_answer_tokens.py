@@ -36,17 +36,17 @@ def parse_args():
 
 USER_INPUT_TEMPLATE = """Question: {question}
 Response: {response}
-Tokenized Response: {response_tokens}
-Please help extract the "answer tokens" from all tokens, removing all redundant information, and the tokens you return must be part of the input Tokenized Response list."""
+Tokenized Response with indices: {indexed_response_tokens}
+Please identify the answer span in the tokenized response. Return only a JSON array of integer token indices from the indexed tokenized response. The selected indices must be valid, in ascending order, and should form the minimal answer span with redundant context removed."""
 
 EXAMPLE_MESSAGES = [
     {
         "role": "user",
-        "content": "Question: What is the correct name for the \"Flying Lady\" ornament on a Rolls Royce radiator.\nResponse: The correct name for the \"Flying Lady\" ornament on a Rolls Royce radiator is the Spirit of Ecstasy.\nTokenized Response: ['▁The', '▁correct', '▁name', '▁for', '▁the', '▁\"', 'F', 'lying', '▁Lady', '\"', '▁or', 'nament', '▁on', '▁a', '▁Roll', 's', '▁Roy', 'ce', '▁radi', 'ator', '▁is', '▁the', '▁Spirit', '▁of', '▁Ec', 'st', 'asy', '.']\nPlease help extract the \"answer tokens\" from all tokens, removing all redundant information, and the tokens you return must form a continuous segment of the input Tokenized Response list."
+        "content": "Question: What is the correct name for the \"Flying Lady\" ornament on a Rolls Royce radiator.\nResponse: The correct name for the \"Flying Lady\" ornament on a Rolls Royce radiator is the Spirit of Ecstasy.\nTokenized Response with indices: [(0, '▁The'), (1, '▁correct'), (2, '▁name'), (3, '▁for'), (4, '▁the'), (5, '▁\"'), (6, 'F'), (7, 'lying'), (8, '▁Lady'), (9, '\"'), (10, '▁or'), (11, 'nament'), (12, '▁on'), (13, '▁a'), (14, '▁Roll'), (15, 's'), (16, '▁Roy'), (17, 'ce'), (18, '▁radi'), (19, 'ator'), (20, '▁is'), (21, '▁the'), (22, '▁Spirit'), (23, '▁of'), (24, '▁Ec'), (25, 'st'), (26, 'asy'), (27, '.')]\nPlease identify the answer span in the tokenized response. Return only a JSON array of integer token indices from the indexed tokenized response."
     },
     {
         "role": "assistant",
-        "content": "['▁the', '▁Spirit', '▁of', '▁Ec', 'st', 'asy']"
+        "content": "[21, 22, 23, 24, 25, 26]"
     },
 ]
 
@@ -106,11 +106,24 @@ class AnswerTokenExtractor:
     def _save_usage_state(self):
         os.makedirs(os.path.dirname(self.usage_path) or ".", exist_ok=True)
         tmp_path = f"{self.usage_path}.tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(self.usage_state, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, self.usage_path)
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(self.usage_state, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.usage_path)
+        except PermissionError as e:
+            # On Windows, os.replace can fail if VS Code, antivirus, or file sync
+            # briefly locks the usage file. Fall back to a direct non-atomic write
+            # so extraction can continue instead of crashing.
+            print(f"Warning: could not atomically replace usage file ({e}); writing directly.")
+            with open(self.usage_path, "w", encoding="utf-8") as f:
+                json.dump(self.usage_state, f, ensure_ascii=False, indent=2)
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except PermissionError:
+                pass
 
     def _cleanup_minute_window(self, key_idx: int):
         now = time.time()
@@ -196,11 +209,12 @@ class AnswerTokenExtractor:
         return tokens
 
     def extract_via_llm(self, question: str, response: str, tokens: List[str]) -> Optional[List[str]]:
-        """Request LLM to select tokens from the tokenized list."""
+        """Request LLM to select answer-token indices from the tokenized list."""
+        indexed_tokens = list(enumerate(tokens))
         prompt = USER_INPUT_TEMPLATE.format(
             question=question,
             response=response,
-            response_tokens=str(tokens)
+            indexed_response_tokens=str(indexed_tokens)
         )
 
         max_attempts = max(6, 6 * len(self.api_keys))
@@ -214,13 +228,25 @@ class AnswerTokenExtractor:
                 )
                 self._record_request()
 
-                reply = completion.choices[0].message.content.strip().replace("'", "\"")
-                extracted = json.loads(reply)
+                reply = completion.choices[0].message.content.strip()
+                if reply.startswith("```"):
+                    reply = reply.strip("`").strip()
+                    if reply.lower().startswith("json"):
+                        reply = reply[4:].strip()
+                extracted_indices = json.loads(reply)
 
-                # Validation: selected tokens must exist in original sequence
-                if all(t in tokens for t in extracted):
-                    return extracted
-                print(f"Invalid token extraction from key {self.current_key_idx + 1}; retrying.")
+                # Validation: selected indices must point to valid tokens.
+                if (
+                    isinstance(extracted_indices, list)
+                    and all(isinstance(i, int) for i in extracted_indices)
+                    and extracted_indices == sorted(extracted_indices)
+                    and all(0 <= i < len(tokens) for i in extracted_indices)
+                ):
+                    return [tokens[i] for i in extracted_indices]
+                print(
+                    f"Invalid token-index extraction from key {self.current_key_idx + 1}; "
+                    f"reply={reply}; retrying."
+                )
             except Exception as e:
                 print(f"Extraction failed (attempt {attempt + 1}) with key {self.current_key_idx + 1}: {e}")
                 if self._is_permanent_quota_error(e):
