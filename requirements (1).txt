@@ -5,4 +5,3 @@ openai
 accelerate
 joblib
 scikit-learn
-tqdm

@@ -9,3 +9,7 @@ __pycache__/
 
 # Local outputs
 *.usage.json
+
+data/small_subset/activations/
+data/small_subset/test_activations/
+data/small_subset/activations.zip
