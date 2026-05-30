@@ -4,7 +4,7 @@ import re
 import string
 import argparse
 import time
-from typing import List, Set, Dict
+from typing import List, Set, Dict, Optional
 
 import torch
 from tqdm import tqdm
@@ -24,9 +24,14 @@ def parse_args():
     parser.add_argument("--tp_size", type=int, default=None, help="Tensor parallel size")
 
     parser.add_argument("--judge_type", type=str, choices=["rule", "llm"], default="rule", help="How to judge correctness")
-    parser.add_argument("--api_key", type=str, default=None, help="API key for LLM Judge")
+    parser.add_argument("--api_key", type=str, default=None, help="Single API key for LLM Judge")
+    parser.add_argument("--api_keys", nargs="+", default=None, help="Multiple API keys for LLM Judge rotation")
     parser.add_argument("--base_url", type=str, default="https://api.openai.com/v1", help="API base URL")
     parser.add_argument("--judge_model", type=str, default="gpt-4o", help="Model name for LLM Judge")
+    parser.add_argument("--rpm_limit", type=int, default=15, help="Requests per minute limit per API key")
+    parser.add_argument("--rpd_limit", type=int, default=500, help="Requests per day limit per API key")
+    parser.add_argument("--usage_path", type=str, default=None, help="Path to save API usage state. Defaults to output_path + '.judge_usage.json'")
+    parser.add_argument("--resume", action="store_true", help="Resume API usage state from usage_path instead of starting fresh")
     
     return parser.parse_args()
 
@@ -80,9 +85,145 @@ class ConsistencySampler:
         # 2. Init Judge Client (if needed)
         self.judge_client = None
         if args.judge_type == "llm":
-            if not args.api_key:
-                raise ValueError("API Key is required for LLM Judge.")
-            self.judge_client = OpenAI(api_key=args.api_key, base_url=args.base_url)
+            self.api_keys = self._load_api_keys()
+            self.usage_path = args.usage_path or f"{args.output_path}.judge_usage.json"
+            self.usage_state = self._load_usage_state() if args.resume else self._new_usage_state()
+            self.current_key_idx = self._find_available_key_or_wait()
+            self.judge_client = self._make_client(self.current_key_idx)
+
+    def _load_api_keys(self) -> List[str]:
+        keys = []
+        if self.args.api_keys:
+            keys.extend(self.args.api_keys)
+        if self.args.api_key:
+            keys.append(self.args.api_key)
+
+        keys = [key.strip() for key in keys if key and key.strip()]
+        if not keys:
+            raise ValueError("Provide at least one API key with --api_key or --api_keys for LLM Judge.")
+        return list(dict.fromkeys(keys))
+
+    def _today(self) -> str:
+        return time.strftime("%Y-%m-%d", time.gmtime())
+
+    def _new_usage_state(self) -> Dict[str, object]:
+        return {
+            "date": self._today(),
+            "current_key_idx": 0,
+            "daily_counts": [0 for _ in self.api_keys],
+            "minute_timestamps": [[] for _ in self.api_keys],
+        }
+
+    def _load_usage_state(self) -> Dict[str, object]:
+        if os.path.exists(self.usage_path):
+            try:
+                with open(self.usage_path, "r", encoding="utf-8") as f:
+                    state = json.load(f)
+                if len(state.get("daily_counts", [])) == len(self.api_keys):
+                    if state.get("date") != self._today():
+                        state["date"] = self._today()
+                        state["daily_counts"] = [0 for _ in self.api_keys]
+                        state["minute_timestamps"] = [[] for _ in self.api_keys]
+                    return state
+            except Exception as e:
+                print(f"Could not load judge usage state from {self.usage_path}: {e}")
+        return self._new_usage_state()
+
+    def _save_usage_state(self):
+        os.makedirs(os.path.dirname(self.usage_path) or ".", exist_ok=True)
+        tmp_path = f"{self.usage_path}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(self.usage_state, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.usage_path)
+        except PermissionError as e:
+            print(f"Warning: could not atomically replace judge usage file ({e}); writing directly.")
+            with open(self.usage_path, "w", encoding="utf-8") as f:
+                json.dump(self.usage_state, f, ensure_ascii=False, indent=2)
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except PermissionError:
+                pass
+
+    def _cleanup_minute_window(self, key_idx: int):
+        now = time.time()
+        self.usage_state["minute_timestamps"][key_idx] = [
+            ts for ts in self.usage_state["minute_timestamps"][key_idx]
+            if now - ts < 60
+        ]
+
+    def _key_has_daily_quota(self, key_idx: int) -> bool:
+        return self.usage_state["daily_counts"][key_idx] < self.args.rpd_limit
+
+    def _key_has_minute_quota(self, key_idx: int) -> bool:
+        self._cleanup_minute_window(key_idx)
+        return len(self.usage_state["minute_timestamps"][key_idx]) < self.args.rpm_limit
+
+    def _find_available_key(self) -> Optional[int]:
+        start_idx = int(self.usage_state.get("current_key_idx", 0)) % len(self.api_keys)
+        for offset in range(len(self.api_keys)):
+            idx = (start_idx + offset) % len(self.api_keys)
+            if self._key_has_daily_quota(idx) and self._key_has_minute_quota(idx):
+                self.usage_state["current_key_idx"] = idx
+                return idx
+        return None
+
+    def _seconds_until_next_key_available(self) -> int:
+        waits = []
+        now = time.time()
+        for idx in range(len(self.api_keys)):
+            if not self._key_has_daily_quota(idx):
+                continue
+            self._cleanup_minute_window(idx)
+            stamps = self.usage_state["minute_timestamps"][idx]
+            if len(stamps) < self.args.rpm_limit:
+                return 0
+            waits.append(max(1, int(61 - (now - min(stamps)))))
+        if waits:
+            return min(waits)
+        raise RuntimeError(f"All API keys reached the daily request limit of {self.args.rpd_limit}.")
+
+    def _find_available_key_or_wait(self) -> int:
+        while True:
+            idx = self._find_available_key()
+            if idx is not None:
+                return idx
+            delay = self._seconds_until_next_key_available()
+            print(f"All judge keys are at RPM limit; waiting {delay}s before retrying.")
+            time.sleep(delay)
+
+    def _make_client(self, key_idx: int) -> OpenAI:
+        print(
+            f"Using judge API key {key_idx + 1}/{len(self.api_keys)}; "
+            f"today={self.usage_state['daily_counts'][key_idx]}/{self.args.rpd_limit}, "
+            f"minute={len(self.usage_state['minute_timestamps'][key_idx])}/{self.args.rpm_limit}"
+        )
+        return OpenAI(api_key=self.api_keys[key_idx], base_url=self.args.base_url)
+
+    def _switch_to_available_key_or_wait(self):
+        idx = self._find_available_key_or_wait()
+        if idx != self.current_key_idx:
+            self.current_key_idx = idx
+            self.judge_client = self._make_client(idx)
+        self._save_usage_state()
+
+    def _record_request(self):
+        now = time.time()
+        self.usage_state["daily_counts"][self.current_key_idx] += 1
+        self.usage_state["minute_timestamps"][self.current_key_idx].append(now)
+        self._cleanup_minute_window(self.current_key_idx)
+        self._save_usage_state()
+
+    def _is_quota_error(self, error: Exception) -> bool:
+        text = str(error).lower()
+        return any(term in text for term in ["quota", "rate limit", "rate_limit", "429", "resource_exhausted", "exceeded"])
+
+    def _is_permanent_quota_error(self, error: Exception) -> bool:
+        text = str(error).lower()
+        return any(term in text for term in ["prepayment credits are depleted", "billing", "daily request", "requests per day"])
 
     def rule_judge(self, response: str, norm_gts: List[str]) -> str:
         """Simple string matching judge."""
@@ -103,22 +244,40 @@ class ConsistencySampler:
             f"Don't add any additional information."
         )
         
-        for attempt in range(5):
+        max_attempts = max(5, 5 * len(self.api_keys))
+        for attempt in range(max_attempts):
+            self._switch_to_available_key_or_wait()
             try:
                 completion = self.judge_client.chat.completions.create(
                     model=self.args.judge_model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.0
                 )
+                self._record_request()
+
                 res = completion.choices[0].message.content.strip().lower()
                 if 't' in res: return "true"
                 if 'f' in res: return "false"
+                print(f"Judge API returned invalid answer with key {self.current_key_idx + 1}: {res}; retrying.")
             except Exception as e:
-                print(f"Judge API failed (attempt {attempt+1}): {e}")
+                print(f"Judge API failed (attempt {attempt+1}) with key {self.current_key_idx + 1}: {e}")
+                if self._is_permanent_quota_error(e):
+                    self.usage_state["daily_counts"][self.current_key_idx] = self.args.rpd_limit
+                    self._save_usage_state()
+                elif self._is_quota_error(e):
+                    self.usage_state["minute_timestamps"][self.current_key_idx].append(time.time())
+                    self._cleanup_minute_window(self.current_key_idx)
+                    self._save_usage_state()
                 time.sleep(1)
         return "error"
 
     def process_data(self):
+        if self.args.judge_type == "llm":
+            os.makedirs(os.path.dirname(self.usage_path) or ".", exist_ok=True)
+            if not self.args.resume:
+                self.usage_state = self._new_usage_state()
+                self._save_usage_state()
+
         dataset = load_dataset("parquet", data_files=self.args.data_path, split="train")
         if self.args.max_samples:
             dataset = dataset.select(range(self.args.max_samples))
