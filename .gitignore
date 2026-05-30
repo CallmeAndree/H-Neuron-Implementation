@@ -1,0 +1,19 @@
+# Environment files with secrets
+.env
+*.env
+h_neuron_scripts/.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local outputs
+*.usage.json
+
+# Local agent/spec tooling
+.roo
+.agent
+openspec/
+
+# Data and generated datasets/artifacts
+data/
