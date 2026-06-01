@@ -3,13 +3,11 @@ import json
 import re
 import string
 import argparse
-import time
-from typing import List, Set, Dict, Optional
+from typing import List, Set, Dict, Mapping
 
 import torch
 from tqdm import tqdm
 from datasets import load_dataset
-from vllm import LLM, SamplingParams
 from openai import OpenAI  # 用于 LLM Judge
 
 def parse_args():
@@ -20,6 +18,7 @@ def parse_args():
     
     parser.add_argument("--sample_num", type=int, default=10, help="Samples per question")
     parser.add_argument("--max_samples", type=int, default=None, help="Maximum number of questions to process")
+    parser.add_argument("--backend", type=str, choices=["auto", "vllm", "transformers"], default="auto", help="Sampling backend. 'auto' tries vLLM first, then falls back to Transformers on import/runtime CUDA mismatch errors.")
     parser.add_argument("--gpu_util", type=float, default=0.7, help="vLLM GPU memory utilization")
     parser.add_argument("--tp_size", type=int, default=None, help="Tensor parallel size")
 
@@ -28,10 +27,7 @@ def parse_args():
     parser.add_argument("--api_keys", nargs="+", default=None, help="Multiple API keys for LLM Judge rotation")
     parser.add_argument("--base_url", type=str, default="https://api.openai.com/v1", help="API base URL")
     parser.add_argument("--judge_model", type=str, default="gpt-4o", help="Model name for LLM Judge")
-    parser.add_argument("--rpm_limit", type=int, default=15, help="Requests per minute limit per API key")
-    parser.add_argument("--rpd_limit", type=int, default=500, help="Requests per day limit per API key")
-    parser.add_argument("--usage_path", type=str, default=None, help="Path to save API usage state. Defaults to output_path + '.judge_usage.json'")
-    parser.add_argument("--resume", action="store_true", help="Resume API usage state from usage_path instead of starting fresh")
+    parser.add_argument("--resume", action="store_true", help="Resume from existing output_path by skipping already processed question IDs")
     
     return parser.parse_args()
 
@@ -68,28 +64,148 @@ class ConsistencySampler:
     def __init__(self, args):
         self.args = args
         
-        # 1. Init Sampling LLM (vLLM)
-        self.tp_size = args.tp_size or torch.cuda.device_count()
-
-        self.sampling_llm = LLM(
-            model=args.model_path,
-            tensor_parallel_size=self.tp_size,
-            gpu_memory_utilization=args.gpu_util,
-            trust_remote_code=True
-        )
-
-        self.sampling_params = SamplingParams(
-            temperature=1.0, top_p=0.9, top_k=50, max_tokens=50
-        )
+        # 1. Init Sampling LLM. Keep vLLM import lazy so CUDA wheel/runtime
+        # mismatches (for example libcudart.so.13 on CUDA 12.x Colab) do not
+        # fail before the Transformers fallback can run.
+        self.backend = None
+        self.sampling_llm = None
+        self.sampling_params = None
+        self.tokenizer = None
+        self.model = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self._init_sampling_backend()
 
         # 2. Init Judge Client (if needed)
         self.judge_client = None
         if args.judge_type == "llm":
             self.api_keys = self._load_api_keys()
-            self.usage_path = args.usage_path or f"{args.output_path}.judge_usage.json"
-            self.usage_state = self._load_usage_state() if args.resume else self._new_usage_state()
-            self.current_key_idx = self._find_available_key_or_wait()
+            self.current_key_idx = 0
             self.judge_client = self._make_client(self.current_key_idx)
+
+    def _is_cuda_mismatch_error(self, error: Exception) -> bool:
+        text = str(error).lower()
+        return any(term in text for term in ["libcudart.so.13", "cuda", "cudart", "undefined symbol"])
+
+    def _log_vllm_fallback(self, error: Exception):
+        print("vLLM backend failed to initialize; falling back to Transformers backend.")
+        print(f"vLLM error: {error}")
+        if self._is_cuda_mismatch_error(error):
+            print(
+                "This looks like a vLLM wheel/CUDA runtime mismatch, not a project path, "
+                "dataset, or model argument issue. Do not symlink libcudart.so.12 to "
+                "libcudart.so.13; use --backend transformers or install a vLLM wheel that "
+                "matches the runtime CUDA/PyTorch stack."
+            )
+
+    def _init_sampling_backend(self):
+        if self.args.backend in ("auto", "vllm"):
+            try:
+                self._init_vllm_backend()
+                return
+            except Exception as e:
+                if self.args.backend == "vllm":
+                    raise RuntimeError(
+                        "Failed to initialize vLLM backend. If this is a CUDA runtime "
+                        "mismatch such as missing libcudart.so.13, rerun with "
+                        "--backend transformers or align vLLM/PyTorch/CUDA versions."
+                    ) from e
+                self._log_vllm_fallback(e)
+
+        self._init_transformers_backend()
+
+    def _init_vllm_backend(self):
+        from vllm import LLM, SamplingParams
+
+        self.tp_size = self.args.tp_size or max(1, torch.cuda.device_count())
+        self.sampling_llm = LLM(
+            model=self.args.model_path,
+            tensor_parallel_size=self.tp_size,
+            gpu_memory_utilization=self.args.gpu_util,
+            trust_remote_code=True
+        )
+        self.sampling_params = SamplingParams(
+            temperature=1.0, top_p=0.9, top_k=50, max_tokens=50
+        )
+        self.backend = "vllm"
+        print("Using vLLM sampling backend.")
+
+    def _init_transformers_backend(self):
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        self.tokenizer = AutoTokenizer.from_pretrained(self.args.model_path, trust_remote_code=True)
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.args.model_path,
+            torch_dtype=dtype,
+            device_map="auto" if torch.cuda.is_available() else None,
+            trust_remote_code=True
+        )
+        if not torch.cuda.is_available():
+            self.model.to(self.device)
+        self.model.eval()
+        self.backend = "transformers"
+        print("Using Transformers sampling backend.")
+
+    def _sample_answer(self, messages: List[Dict[str, str]]) -> str:
+        if self.backend == "vllm":
+            outputs = self.sampling_llm.chat(messages, self.sampling_params, use_tqdm=False)
+            return outputs[0].outputs[0].text.strip()
+
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            encoded = self.tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                return_tensors="pt"
+            )
+        else:
+            prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages) + "\nassistant:"
+            encoded = self.tokenizer(prompt, return_tensors="pt")
+
+        if torch.is_tensor(encoded):
+            input_ids = encoded
+            attention_mask = torch.ones_like(input_ids)
+        elif isinstance(encoded, Mapping) or hasattr(encoded, "keys"):
+            if "input_ids" not in encoded:
+                raise TypeError(
+                    f"Tokenizer output is missing input_ids; got keys: {list(encoded.keys())}"
+                )
+            input_ids = encoded["input_ids"]
+            attention_mask = encoded.get("attention_mask")
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids)
+        else:
+            raise TypeError(
+                f"Unsupported tokenizer output type for Transformers sampling: {type(encoded).__name__}"
+            )
+
+        if not torch.is_tensor(input_ids):
+            raise TypeError(
+                f"Tokenizer input_ids must be a Tensor, got {type(input_ids).__name__}"
+            )
+        if not torch.is_tensor(attention_mask):
+            raise TypeError(
+                f"Tokenizer attention_mask must be a Tensor, got {type(attention_mask).__name__}"
+            )
+
+        input_ids = input_ids.to(self.model.device)
+        attention_mask = attention_mask.to(self.model.device)
+        with torch.no_grad():
+            output_ids = self.model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                do_sample=True,
+                temperature=1.0,
+                top_p=0.9,
+                top_k=50,
+                max_new_tokens=50,
+                pad_token_id=self.tokenizer.pad_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+            )
+        new_tokens = output_ids[0, input_ids.shape[-1]:]
+        return self.tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
     def _load_api_keys(self) -> List[str]:
         keys = []
@@ -103,119 +219,15 @@ class ConsistencySampler:
             raise ValueError("Provide at least one API key with --api_key or --api_keys for LLM Judge.")
         return list(dict.fromkeys(keys))
 
-    def _today(self) -> str:
-        return time.strftime("%Y-%m-%d", time.gmtime())
-
-    def _new_usage_state(self) -> Dict[str, object]:
-        return {
-            "date": self._today(),
-            "current_key_idx": 0,
-            "daily_counts": [0 for _ in self.api_keys],
-            "minute_timestamps": [[] for _ in self.api_keys],
-        }
-
-    def _load_usage_state(self) -> Dict[str, object]:
-        if os.path.exists(self.usage_path):
-            try:
-                with open(self.usage_path, "r", encoding="utf-8") as f:
-                    state = json.load(f)
-                if len(state.get("daily_counts", [])) == len(self.api_keys):
-                    if state.get("date") != self._today():
-                        state["date"] = self._today()
-                        state["daily_counts"] = [0 for _ in self.api_keys]
-                        state["minute_timestamps"] = [[] for _ in self.api_keys]
-                    return state
-            except Exception as e:
-                print(f"Could not load judge usage state from {self.usage_path}: {e}")
-        return self._new_usage_state()
-
-    def _save_usage_state(self):
-        os.makedirs(os.path.dirname(self.usage_path) or ".", exist_ok=True)
-        tmp_path = f"{self.usage_path}.tmp"
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(self.usage_state, f, ensure_ascii=False, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_path, self.usage_path)
-        except PermissionError as e:
-            print(f"Warning: could not atomically replace judge usage file ({e}); writing directly.")
-            with open(self.usage_path, "w", encoding="utf-8") as f:
-                json.dump(self.usage_state, f, ensure_ascii=False, indent=2)
-            try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except PermissionError:
-                pass
-
-    def _cleanup_minute_window(self, key_idx: int):
-        now = time.time()
-        self.usage_state["minute_timestamps"][key_idx] = [
-            ts for ts in self.usage_state["minute_timestamps"][key_idx]
-            if now - ts < 60
-        ]
-
-    def _key_has_daily_quota(self, key_idx: int) -> bool:
-        return self.usage_state["daily_counts"][key_idx] < self.args.rpd_limit
-
-    def _key_has_minute_quota(self, key_idx: int) -> bool:
-        self._cleanup_minute_window(key_idx)
-        return len(self.usage_state["minute_timestamps"][key_idx]) < self.args.rpm_limit
-
-    def _find_available_key(self) -> Optional[int]:
-        start_idx = int(self.usage_state.get("current_key_idx", 0)) % len(self.api_keys)
-        for offset in range(len(self.api_keys)):
-            idx = (start_idx + offset) % len(self.api_keys)
-            if self._key_has_daily_quota(idx) and self._key_has_minute_quota(idx):
-                self.usage_state["current_key_idx"] = idx
-                return idx
-        return None
-
-    def _seconds_until_next_key_available(self) -> int:
-        waits = []
-        now = time.time()
-        for idx in range(len(self.api_keys)):
-            if not self._key_has_daily_quota(idx):
-                continue
-            self._cleanup_minute_window(idx)
-            stamps = self.usage_state["minute_timestamps"][idx]
-            if len(stamps) < self.args.rpm_limit:
-                return 0
-            waits.append(max(1, int(61 - (now - min(stamps)))))
-        if waits:
-            return min(waits)
-        raise RuntimeError(f"All API keys reached the daily request limit of {self.args.rpd_limit}.")
-
-    def _find_available_key_or_wait(self) -> int:
-        while True:
-            idx = self._find_available_key()
-            if idx is not None:
-                return idx
-            delay = self._seconds_until_next_key_available()
-            print(f"All judge keys are at RPM limit; waiting {delay}s before retrying.")
-            time.sleep(delay)
-
     def _make_client(self, key_idx: int) -> OpenAI:
-        print(
-            f"Using judge API key {key_idx + 1}/{len(self.api_keys)}; "
-            f"today={self.usage_state['daily_counts'][key_idx]}/{self.args.rpd_limit}, "
-            f"minute={len(self.usage_state['minute_timestamps'][key_idx])}/{self.args.rpm_limit}"
-        )
+        print(f"Using judge API key {key_idx + 1}/{len(self.api_keys)}")
         return OpenAI(api_key=self.api_keys[key_idx], base_url=self.args.base_url)
 
-    def _switch_to_available_key_or_wait(self):
-        idx = self._find_available_key_or_wait()
-        if idx != self.current_key_idx:
-            self.current_key_idx = idx
-            self.judge_client = self._make_client(idx)
-        self._save_usage_state()
-
-    def _record_request(self):
-        now = time.time()
-        self.usage_state["daily_counts"][self.current_key_idx] += 1
-        self.usage_state["minute_timestamps"][self.current_key_idx].append(now)
-        self._cleanup_minute_window(self.current_key_idx)
-        self._save_usage_state()
+    def _switch_to_next_key(self):
+        if len(self.api_keys) <= 1:
+            return
+        self.current_key_idx = (self.current_key_idx + 1) % len(self.api_keys)
+        self.judge_client = self._make_client(self.current_key_idx)
 
     def _is_quota_error(self, error: Exception) -> bool:
         text = str(error).lower()
@@ -246,47 +258,40 @@ class ConsistencySampler:
         
         max_attempts = max(5, 5 * len(self.api_keys))
         for attempt in range(max_attempts):
-            self._switch_to_available_key_or_wait()
             try:
                 completion = self.judge_client.chat.completions.create(
                     model=self.args.judge_model,
                     messages=[{"role": "user", "content": prompt}],
                     temperature=0.0
                 )
-                self._record_request()
-
                 res = completion.choices[0].message.content.strip().lower()
                 if 't' in res: return "true"
                 if 'f' in res: return "false"
                 print(f"Judge API returned invalid answer with key {self.current_key_idx + 1}: {res}; retrying.")
             except Exception as e:
                 print(f"Judge API failed (attempt {attempt+1}) with key {self.current_key_idx + 1}: {e}")
-                if self._is_permanent_quota_error(e):
-                    self.usage_state["daily_counts"][self.current_key_idx] = self.args.rpd_limit
-                    self._save_usage_state()
-                elif self._is_quota_error(e):
-                    self.usage_state["minute_timestamps"][self.current_key_idx].append(time.time())
-                    self._cleanup_minute_window(self.current_key_idx)
-                    self._save_usage_state()
-                time.sleep(1)
+                if self._is_quota_error(e):
+                    self._switch_to_next_key()
         return "error"
 
     def process_data(self):
-        if self.args.judge_type == "llm":
-            os.makedirs(os.path.dirname(self.usage_path) or ".", exist_ok=True)
-            if not self.args.resume:
-                self.usage_state = self._new_usage_state()
-                self._save_usage_state()
-
         dataset = load_dataset("parquet", data_files=self.args.data_path, split="train")
         if self.args.max_samples:
             dataset = dataset.select(range(self.args.max_samples))
-        processed_qids = load_existing_qids(self.args.output_path)
+        if self.args.resume:
+            processed_qids = load_existing_qids(self.args.output_path)
+            output_mode = 'a'
+            print(f"Resume enabled: found {len(processed_qids)} already processed IDs in {self.args.output_path}")
+        else:
+            processed_qids = set()
+            output_mode = 'w'
+            if os.path.exists(self.args.output_path):
+                print(f"Resume disabled: overwriting existing output file {self.args.output_path}")
         
         all_correct_count = 0
         all_incorrect_count = 0
 
-        with open(self.args.output_path, 'a', encoding='utf-8') as f:
+        with open(self.args.output_path, output_mode, encoding='utf-8') as f:
             for item in tqdm(dataset, desc=f"Sampling ({self.args.judge_type} judge)"):
                 qid = str(item.get('question_id', ''))
                 if qid in processed_qids: continue
@@ -314,8 +319,7 @@ class ConsistencySampler:
 
                 for _ in range(self.args.sample_num):
                     try:
-                        outputs = self.sampling_llm.chat(messages, self.sampling_params, use_tqdm=False)
-                        ans = outputs[0].outputs[0].text.strip()
+                        ans = self._sample_answer(messages)
                         responses.append(ans)
 
                         # 1. Uncertainty check (Rule-based pre-filter)
@@ -354,6 +358,9 @@ class ConsistencySampler:
                     }
                 }
                 f.write(json.dumps(result, ensure_ascii=False) + '\n')
+                f.flush()
+                os.fsync(f.fileno())
+                processed_qids.add(qid)
                 
                 if len(processed_qids) % 10 == 0:
                     tqdm.write(f"Stats -> All-Correct: {all_correct_count}, All-Incorrect: {all_incorrect_count}")

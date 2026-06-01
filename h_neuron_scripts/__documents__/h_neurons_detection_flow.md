@@ -446,9 +446,6 @@ Arguments quan trọng:
 --api_keys         nhiều API keys để rotate
 --base_url         OpenAI-compatible endpoint
 --llm_model        LLM dùng để chọn answer token indices
---rpm_limit        request/min/key
---rpd_limit        request/day/key
---usage_path       file lưu quota state
 ```
 
 ### 6.3. Tokenizer
@@ -532,22 +529,11 @@ Nếu valid, script convert indices sang token strings:
 answer_tokens = [tokens[i] for i in extracted_indices]
 ```
 
-### 6.7. Quota/rate-limit handling
+### 6.7. API-key rotation and resume
 
-Script hỗ trợ nhiều API keys:
+Script hỗ trợ nhiều API keys và bắt đầu với key đầu tiên. Nếu API trả về quota/rate-limit style error, script rotate sang key kế tiếp trong cùng process và retry. Script không lưu RPM/RPD quota state ra file.
 
-- `daily_counts`: số requests trong ngày cho mỗi key.
-- `minute_timestamps`: timestamps trong 60 giây gần nhất cho mỗi key.
-- `current_key_idx`: key đang dùng.
-
-Trước mỗi request:
-
-1. tìm key còn daily quota và RPM quota;
-2. nếu không có key nào còn RPM quota, sleep tới khi key sớm nhất available;
-3. nếu gặp quota/billing/daily-limit error, update state tương ứng;
-4. lưu state vào `usage_path`.
-
-Có xử lí riêng cho Windows khi `os.replace` bị lock bởi VS Code/antivirus/file sync: fallback sang direct write.
+Resume chỉ dựa vào `output_path`: khi `--resume` được bật, script đọc các qid đã có trong output JSONL, append vào file hiện tại, và skip các qid đã xử lí. Các file quota state cũ như `*.usage.json` không còn được đọc hoặc ghi.
 
 ### 6.8. Output
 
@@ -1523,7 +1509,83 @@ Ví dụ logic, không phải command bắt buộc:
 
 ---
 
-## 16. Tóm tắt ngắn
+## 16. Debug log — Colab vLLM/CUDA runtime mismatch
+
+### 16.1. Symptom
+
+Khi chạy `h_neuron_scripts/collect_responses.py` trên Colab, script fail ngay tại import vLLM:
+
+```text
+from vllm import LLM, SamplingParams
+ImportError: libcudart.so.13: cannot open shared object file: No such file or directory
+```
+
+Traceback đi qua package `vllm` rồi fail khi import CUDA extension:
+
+```text
+import vllm._C
+ImportError: libcudart.so.13
+```
+
+### 16.2. Diagnosis
+
+Đây là lỗi mismatch giữa vLLM wheel và CUDA runtime trong môi trường Colab, không phải lỗi import path của project.
+
+Các khả năng đã cân nhắc:
+
+1. Sai path script hoặc sai working directory.
+2. Thiếu dependency Python thông thường.
+3. Lỗi import nội bộ trong `h_neuron_scripts`.
+4. PyTorch/CUDA không có GPU.
+5. Model path hoặc data path sai.
+6. vLLM wheel được build/packaged cho CUDA runtime khác môi trường đang chạy.
+7. Notebook Colab còn cell cài/reinstall vLLM hoặc CUDA stack không tương thích.
+
+Nguồn lỗi có khả năng cao nhất:
+
+- installed `vllm` wheel đang expect CUDA 13 runtime;
+- Colab runtime hiện tại không có `libcudart.so.13`;
+- vì `collect_responses.py` import `vllm` ở module import time nên lỗi xảy ra trước khi argparse hoặc logic pipeline chạy.
+
+### 16.3. Fix/workaround đã áp dụng
+
+Workaround an toàn cho Colab/T4 là không dùng vLLM cho bước response collection, mà dùng Hugging Face Transformers-only notebook path.
+
+Đã chạy script:
+
+```text
+python new_scripts/disable_vllm_notebook.py
+```
+
+Script này update notebook:
+
+```text
+new_scripts/H_neurons_1.ipynb
+```
+
+Các thay đổi chính trong notebook:
+
+- không install `vllm`;
+- không uninstall/reinstall PyTorch/CUDA stack trong Colab;
+- đặt một số env var phòng ngừa accidental vLLM import;
+- dùng `transformers.AutoModelForCausalLM` và `transformers.AutoTokenizer` để sample response;
+- giữ logic judge/output JSONL tương đương bước collection.
+
+### 16.4. Cách chạy sau fix
+
+Trên Colab, dùng notebook đã update:
+
+```text
+new_scripts/H_neurons_1.ipynb
+```
+
+Chạy notebook từ đầu để cài dependencies và load model bằng Transformers. Không chạy lại command cài vLLM trong notebook Colab nếu mục tiêu là tránh lỗi CUDA runtime mismatch này.
+
+Nếu bắt buộc muốn dùng `collect_responses.py` với vLLM, cần tự align toàn bộ stack vLLM/PyTorch/CUDA sao cho wheel vLLM khớp CUDA runtime có sẵn trong môi trường. Với Colab, hướng này kém ổn định hơn Transformers-only workaround.
+
+---
+
+## 17. Tóm tắt ngắn
 
 `h_neuron_scripts` triển khai một supervised H-Neuron detection pipeline:
 
