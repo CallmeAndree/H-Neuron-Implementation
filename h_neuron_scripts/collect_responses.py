@@ -139,7 +139,7 @@ class ConsistencySampler:
         dtype = torch.float16 if torch.cuda.is_available() else torch.float32
         self.model = AutoModelForCausalLM.from_pretrained(
             self.args.model_path,
-            torch_dtype=dtype,
+            dtype=dtype,
             device_map="auto" if torch.cuda.is_available() else None,
             trust_remote_code=True
         )
@@ -277,7 +277,13 @@ class ConsistencySampler:
     def process_data(self):
         dataset = load_dataset("parquet", data_files=self.args.data_path, split="train")
         if self.args.max_samples:
-            dataset = dataset.select(range(self.args.max_samples))
+            sample_count = min(self.args.max_samples, len(dataset))
+            if sample_count < self.args.max_samples:
+                print(
+                    f"Requested --max_samples {self.args.max_samples}, but dataset only has "
+                    f"{len(dataset)} examples. Processing {sample_count} examples instead."
+                )
+            dataset = dataset.select(range(sample_count))
         if self.args.resume:
             processed_qids = load_existing_qids(self.args.output_path)
             output_mode = 'a'
