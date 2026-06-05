@@ -151,22 +151,30 @@ class AnswerTokenExtractor:
     def get_single_sample(self, row: Dict[str, Any], line_num: int) -> Tuple[str, Dict[str, Any]]:
         if not isinstance(row, dict):
             raise ValueError(f"line {line_num}: JSONL row is not a JSON object.")
-        if len(row) != 1:
-            raise ValueError(
-                f"line {line_num}: expected exactly one top-level qid, got {len(row)}."
-            )
 
-        qid = next(iter(row))
-        content = row[qid]
-        if not isinstance(content, dict):
-            raise ValueError(
-                f"line {line_num}, qid {qid}: expected sample content to be an object, "
-                f"got {type(content).__name__}. This usually means --input_path points "
-                "to the wrong JSONL format; expected {\"qid\": {\"question\": ..., "
-                "\"responses\": [...], \"judges\": [...]}} on each line."
-            )
+        # Supported input format 1: {"tc_1": {"question": ..., "responses": ..., "judges": ...}}
+        if len(row) == 1:
+            qid = next(iter(row))
+            content = row[qid]
+            if not isinstance(content, dict):
+                raise ValueError(
+                    f"line {line_num}, qid {qid}: expected sample content to be an object, "
+                    f"got {type(content).__name__}."
+                )
+            return qid, content
 
-        return qid, content
+        # Supported input format 2: {"qid": "tc_1", "question": ..., "responses": ..., "judges": ...}
+        if "qid" in row:
+            qid = row["qid"]
+            if not isinstance(qid, str) or not qid.strip():
+                raise ValueError(f"line {line_num}: qid must be a non-empty string.")
+            content = {key: value for key, value in row.items() if key != "qid"}
+            return qid, content
+
+        raise ValueError(
+            f"line {line_num}: expected either one wrapped top-level qid or a flat row "
+            f"with a qid field; got keys {list(row.keys())}."
+        )
 
     def run(self):
         os.makedirs(os.path.dirname(self.args.output_path) or ".", exist_ok=True)
