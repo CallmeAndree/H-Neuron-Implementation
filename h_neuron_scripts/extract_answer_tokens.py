@@ -1,7 +1,7 @@
 import os
 import json
 import argparse
-from typing import List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from tqdm import tqdm
 from openai import OpenAI
@@ -148,6 +148,26 @@ class AnswerTokenExtractor:
                     continue
         return ids
 
+    def get_single_sample(self, row: Dict[str, Any], line_num: int) -> Tuple[str, Dict[str, Any]]:
+        if not isinstance(row, dict):
+            raise ValueError(f"line {line_num}: JSONL row is not a JSON object.")
+        if len(row) != 1:
+            raise ValueError(
+                f"line {line_num}: expected exactly one top-level qid, got {len(row)}."
+            )
+
+        qid = next(iter(row))
+        content = row[qid]
+        if not isinstance(content, dict):
+            raise ValueError(
+                f"line {line_num}, qid {qid}: expected sample content to be an object, "
+                f"got {type(content).__name__}. This usually means --input_path points "
+                "to the wrong JSONL format; expected {\"qid\": {\"question\": ..., "
+                "\"responses\": [...], \"judges\": [...]}} on each line."
+            )
+
+        return qid, content
+
     def run(self):
         os.makedirs(os.path.dirname(self.args.output_path) or ".", exist_ok=True)
 
@@ -163,37 +183,48 @@ class AnswerTokenExtractor:
         with open(self.args.input_path, "r", encoding="utf-8") as f_in, \
              open(self.args.output_path, output_mode, encoding="utf-8") as f_out:
 
-            for line in tqdm(f_in, desc="Processing tokens"):
+            for line_num, line in enumerate(tqdm(f_in, desc="Processing tokens"), start=1):
+                line = line.strip()
+                if not line:
+                    continue
+
                 data = json.loads(line)
-                qid = list(data.keys())[0]
-                content = data[qid]
+                qid, content = self.get_single_sample(data, line_num)
 
                 if qid in processed_ids:
                     continue
 
                 # Ensure all responses have the same judge outcome (true/false)
-                judges = content["judges"]
-                if len(set(judges)) != 1 or "uncertain" in judges or "error" in judges:
+                judges = content.get("judges")
+                if not isinstance(judges, list) or not judges:
+                    raise ValueError(f"line {line_num}, qid {qid}: missing or empty judges list.")
+                normalized_judges = [str(judge).strip().lower() for judge in judges]
+                if len(set(normalized_judges)) != 1 or normalized_judges[0] not in {"true", "false"}:
                     continue
 
                 # Take the most frequent response as representative
-                responses = content["responses"]
+                responses = content.get("responses")
+                if not isinstance(responses, list) or not responses:
+                    raise ValueError(f"line {line_num}, qid {qid}: missing or empty responses list.")
                 rep_response = max(set(responses), key=responses.count)
 
                 # Tokenization
                 tokenized_list = self.get_tokenized_list(rep_response)
 
                 # LLM Extraction
-                answer_tokens = self.extract_via_llm(content["question"], rep_response, tokenized_list)
+                question = content.get("question")
+                if not isinstance(question, str) or not question.strip():
+                    raise ValueError(f"line {line_num}, qid {qid}: missing or empty question string.")
+                answer_tokens = self.extract_via_llm(question, rep_response, tokenized_list)
 
                 if answer_tokens:
                     result = {
                         qid: {
-                            "question": content["question"],
+                            "question": question,
                             "response": rep_response,
                             "tokenized_response": tokenized_list,
                             "answer_tokens": answer_tokens,
-                            "judge": judges[0]  # Consistently correct or consistently hallucinated
+                            "judge": normalized_judges[0]  # Consistently correct or consistently hallucinated
                         }
                     }
                     f_out.write(json.dumps(result, ensure_ascii=False) + "\n")
