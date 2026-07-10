@@ -110,7 +110,7 @@ def llm_judge(question, response, answer_list):
 
 
 DATA_PATH = '/content/H-Neuron-Implementation/data/TriviaQA/rc.nocontext/train-00000-of-00001.parquet'
-OUTPUT_PATH = '/content/H-Neuron-Implementation/data/small_subset/test_qwen_samples.jsonl'
+OUTPUT_PATH = '/content/H-Neuron-Implementation/data/small_subset_qwen7b/test_qwen_samples.jsonl'
 SAMPLE_NUM = 5
 MAX_SAMPLES = 200
 MAX_NEW_TOKENS = 50

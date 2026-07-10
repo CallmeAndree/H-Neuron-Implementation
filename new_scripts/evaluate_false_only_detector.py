@@ -9,10 +9,10 @@ import numpy as np
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate a hallucination detector on a false-only test set.")
-    parser.add_argument("--classifier_path", type=str, default="data/small_subset/classifier/classifier.pkl")
-    parser.add_argument("--test_ids", type=str, default="data/small_subset/test_qwen_ids.json")
-    parser.add_argument("--test_acts", type=str, default="data/small_subset/test_activations/answer_tokens")
-    parser.add_argument("--output_path", type=str, default="data/small_subset/false_only_detector_results.json")
+    parser.add_argument("--classifier_path", type=str, default="data/small_subset_qwen7b/classifier/classifier.pkl")
+    parser.add_argument("--test_ids", type=str, default="data/small_subset_qwen7b/test_qwen_ids.json")
+    parser.add_argument("--test_acts", type=str, default="data/small_subset_qwen7b/test_activations/answer_tokens")
+    parser.add_argument("--output_path", type=str, default="data/small_subset_qwen7b/false_only_detector_results.json")
     return parser.parse_args()
 
 

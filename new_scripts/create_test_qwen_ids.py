@@ -2,8 +2,8 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
-input_path = Path("data/small_subset/test_answer_tokens_qwen.jsonl")
-output_path = Path("data/small_subset/test_qwen_ids.json")
+input_path = Path("data/small_subset_qwen7b/test_answer_tokens_qwen.jsonl")
+output_path = Path("data/small_subset_qwen7b/test_qwen_ids.json")
 
 ids = defaultdict(list)
 total = 0

@@ -6,3 +6,5 @@ accelerate
 joblib
 scikit-learn
 tqdm
+bitsandbytes
+autoawq

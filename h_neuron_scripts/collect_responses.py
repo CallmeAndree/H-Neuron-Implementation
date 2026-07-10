@@ -21,6 +21,18 @@ def parse_args():
     parser.add_argument("--backend", type=str, choices=["auto", "vllm", "transformers"], default="auto", help="Sampling backend. 'auto' tries vLLM first, then falls back to Transformers on import/runtime CUDA mismatch errors.")
     parser.add_argument("--gpu_util", type=float, default=0.7, help="vLLM GPU memory utilization")
     parser.add_argument("--tp_size", type=int, default=None, help="Tensor parallel size")
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        choices=["none", "awq", "gptq", "bitsandbytes"],
+        default="none",
+        help=(
+            "Quantization method. Use 'awq' or 'gptq' when --model_path points to a "
+            "pre-quantized checkpoint (e.g. Qwen/Qwen2.5-7B-Instruct-AWQ) so vLLM loads "
+            "it with the matching kernels. Use 'bitsandbytes' to 4-bit quantize a "
+            "full-precision checkpoint on the fly with the Transformers fallback backend."
+        ),
+    )
 
     parser.add_argument("--judge_type", type=str, choices=["rule", "llm"], default="rule", help="How to judge correctness")
     parser.add_argument("--api_key", type=str, default=None, help="Single API key for LLM Judge")
@@ -117,17 +129,31 @@ class ConsistencySampler:
         from vllm import LLM, SamplingParams
 
         self.tp_size = self.args.tp_size or max(1, torch.cuda.device_count())
-        self.sampling_llm = LLM(
+        llm_kwargs = dict(
             model=self.args.model_path,
             tensor_parallel_size=self.tp_size,
             gpu_memory_utilization=self.args.gpu_util,
             trust_remote_code=True
         )
+
+        quant = self.args.quantization
+        if quant == "awq":
+            # Expects a pre-quantized AWQ checkpoint, e.g. Qwen/Qwen2.5-7B-Instruct-AWQ.
+            llm_kwargs["quantization"] = "awq"
+        elif quant == "gptq":
+            # Expects a pre-quantized GPTQ checkpoint, e.g. Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4.
+            llm_kwargs["quantization"] = "gptq"
+        elif quant == "bitsandbytes":
+            # On-the-fly 4-bit quantization of a full-precision checkpoint.
+            llm_kwargs["quantization"] = "bitsandbytes"
+            llm_kwargs["load_format"] = "bitsandbytes"
+
+        self.sampling_llm = LLM(**llm_kwargs)
         self.sampling_params = SamplingParams(
             temperature=1.0, top_p=0.9, top_k=50, max_tokens=50
         )
         self.backend = "vllm"
-        print("Using vLLM sampling backend.")
+        print(f"Using vLLM sampling backend (quantization={quant}).")
 
     def _init_transformers_backend(self):
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -137,17 +163,38 @@ class ConsistencySampler:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.args.model_path,
-            dtype=dtype,
+        model_kwargs = dict(
             device_map="auto" if torch.cuda.is_available() else None,
             trust_remote_code=True
+        )
+
+        quant = self.args.quantization
+        if quant == "bitsandbytes":
+            if not torch.cuda.is_available():
+                raise RuntimeError("bitsandbytes quantization requires a CUDA GPU.")
+            from transformers import BitsAndBytesConfig
+
+            model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+            )
+        else:
+            # awq/gptq checkpoints carry their own quantization_config in config.json
+            # and Transformers picks the right kernels up automatically; "none" just
+            # loads full precision weights.
+            model_kwargs["dtype"] = dtype
+
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.args.model_path,
+            **model_kwargs
         )
         if not torch.cuda.is_available():
             self.model.to(self.device)
         self.model.eval()
         self.backend = "transformers"
-        print("Using Transformers sampling backend.")
+        print(f"Using Transformers sampling backend (quantization={quant}).")
 
     def _sample_answer(self, messages: List[Dict[str, str]]) -> str:
         if self.backend == "vllm":

@@ -3,9 +3,9 @@ import random
 from collections import Counter, defaultdict
 from pathlib import Path
 
-SOURCE_PATH = Path("data/small_subset/train_qwen_samples_consistent.jsonl")
-TRAIN_PATH = Path("data/small_subset/train_qwen_samples_91_true_91_false.jsonl")
-OUTPUT_PATH = Path("data/small_subset/test_qwen_samples.jsonl")
+SOURCE_PATH = Path("data/small_subset_qwen7b/train_qwen_samples_consistent.jsonl")
+TRAIN_PATH = Path("data/small_subset_qwen7b/train_qwen_samples_91_true_91_false.jsonl")
+OUTPUT_PATH = Path("data/small_subset_qwen7b/test_qwen_samples.jsonl")
 SEED = 42
 TARGET_TOTAL = 200
 TARGET_PER_CLASS = TARGET_TOTAL // 2
